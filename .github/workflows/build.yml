@@ -18,6 +18,8 @@ jobs:
   build:
     name: build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "--cap-lints warn"
     strategy:
       fail-fast: false
       matrix:
