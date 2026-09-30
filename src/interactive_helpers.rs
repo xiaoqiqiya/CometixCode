@@ -46,7 +46,6 @@ use crate::utils::ide::{is_jetbrains_ide, to_ide_display_name};
 use crate::utils::settings::SettingSource;
 use crate::utils::settings::get_settings_for_source;
 use crate::utils::status_notice_definitions::{MemoryFileInfo, StatusNoticeContext};
-use crate::utils::theme::ThemeName;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -70,7 +69,6 @@ pub struct SetupScreensSnapshot {
     pub oauth_enabled: bool,
     pub api_key_needing_approval: Option<String>,
     pub offer_terminal_setup: bool,
-    pub theme_name: Option<ThemeName>,
     pub terminal_name: Option<String>,
     pub show_claude_in_chrome_onboarding: bool,
     pub claude_in_chrome_extension_installed: bool,
@@ -92,12 +90,11 @@ fn api_key_needing_onboarding_approval(
     if is_running_on_homespace() {
         return None;
     }
-    let api_key = get_env("ANTHROPIC_API_KEY")?;
-    let trimmed = api_key.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let truncated = normalize_api_key_for_config(trimmed);
+    // CC Onboarding.tsx:132-138: only an empty value is absent, and the
+    // suffix is taken from the value as set; auth matches the same
+    // untrimmed bytes, so a trimmed suffix would never be found approved.
+    let api_key = get_env("ANTHROPIC_API_KEY").filter(|value| !value.is_empty())?;
+    let truncated = normalize_api_key_for_config(&api_key);
     (get_custom_api_key_status(global_config, &truncated) == CustomApiKeyStatus::New)
         .then_some(truncated)
 }
@@ -128,7 +125,6 @@ pub fn setup_screens_snapshot_from_readonly_runtime(
         oauth_enabled: is_anthropic_auth_enabled(),
         api_key_needing_approval: api_key_needing_onboarding_approval(global_config, get_env),
         offer_terminal_setup: should_offer_terminal_setup_for(terminal_name.as_deref(), platform),
-        theme_name: configured_theme.and_then(ThemeName::from_config_or_display),
         terminal_name,
         show_claude_in_chrome_onboarding: enable_claude_in_chrome
             && global_config.has_completed_claude_in_chrome_onboarding != Some(true),
@@ -265,14 +261,29 @@ pub fn exit_with_error(
     system_context: &mut SystemContext,
     exit_code: &AtomicI32,
     message: impl Into<String>,
-    color: Color,
 ) -> AnyElement<'static> {
     exit_code.store(1, Ordering::SeqCst);
     system_context.exit();
     element! {
-        Text(content: message.into(), color: color)
+        ExitMessage(message: message.into())
     }
     .into_any()
+}
+
+#[derive(Default, Props)]
+struct ExitMessageProps {
+    message: String,
+}
+
+/// Maps to: CC `interactiveHelpers.tsx:108-110` `exitWithMessage`'s
+/// `<Text color={color}>`, with `exitWithError`'s `color: 'error'`. The
+/// colour is a theme key, resolved under the root's ThemeProvider.
+#[component]
+fn ExitMessage(props: &ExitMessageProps, hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let theme = hooks.use_context::<crate::utils::theme::Theme>();
+    element! {
+        Text(content: props.message.clone(), color: theme.error)
+    }
 }
 
 pub fn show_setup_screens(
@@ -350,19 +361,42 @@ fn SetupScreensHost<'a>(
         show_claude_in_chrome_onboarding,
     );
 
-    match setup_gate {
+    let gate_element = match setup_gate {
         SetupScreenGate::Onboarding => {
+            // Maps to: CC `interactiveHelpers.tsx:171-182` — onboarding is a
+            // `showSetupDialog(…, { onChangeAppState })`, i.e. its own
+            // `<AppStateProvider><KeybindingSetup>` (:127-128), which the theme
+            // step's ThemePicker reads. The other setup dialogs read no
+            // AppState yet and keep only the KeybindingSetup below (seam).
             let snapshot = setup_screens_snapshot.clone();
+            let keybinding_key = format!("{setup_gate:?}");
+            // SEAM: CC's `getDefaultAppState()` seeds `settings:
+            // getInitialSettings()` (AppStateStore.ts:469), which the picker's
+            // syntax toggle reads. Seeding it here waits for the env redesign:
+            // the port's onChangeAppState re-applies settings env on any
+            // settings write that carries one, which a toggle would then do
+            // before trust.
             element! {
-                Onboarding(
-                    on_done: move |_| {
-                        onboarding_dismissed.set(true);
-                    },
-                    oauth_enabled: snapshot.oauth_enabled,
-                    api_key_needing_approval: snapshot.api_key_needing_approval.clone(),
-                    offer_terminal_setup: snapshot.offer_terminal_setup,
-                    theme_name: snapshot.theme_name,
-                    terminal_name: snapshot.terminal_name.clone(),
+                crate::state::app_state::AppStateProvider(
+                    on_change_app_state: Some(crate::state::on_change_app_state::default_on_change()),
+                    children: crate::state::app_state::ProviderChildren::new(move || {
+                        let snapshot = snapshot.clone();
+                        let mut dismissed = onboarding_dismissed;
+                        element! {
+                            crate::keybindings::keybinding_provider_setup::KeybindingSetup(key: keybinding_key.clone()) {
+                                Onboarding(
+                                    on_done: move |_| {
+                                        dismissed.set(true);
+                                    },
+                                    oauth_enabled: snapshot.oauth_enabled,
+                                    api_key_needing_approval: snapshot.api_key_needing_approval.clone(),
+                                    offer_terminal_setup: snapshot.offer_terminal_setup,
+                                    terminal_name: snapshot.terminal_name.clone(),
+                                )
+                            }
+                        }
+                        .into_any()
+                    }),
                 )
             }
             .into_any()
@@ -485,16 +519,47 @@ fn SetupScreensHost<'a>(
             }
             element! { Fragment }.into_any()
         }
+    };
+    // Onboarding already carries its showSetupDialog wrappers.
+    if matches!(setup_gate, SetupScreenGate::Ready | SetupScreenGate::Onboarding) {
+        return gate_element;
     }
+    // Maps to: CC `interactiveHelpers.tsx:121-131` `showSetupDialog` — every
+    // setup dialog renders inside its own `<KeybindingSetup>`. Keyed by gate,
+    // so each dialog gets a fresh one, as each CC `showDialog` render does.
+    element! {
+        crate::keybindings::keybinding_provider_setup::KeybindingSetup(key: format!("{setup_gate:?}")) {
+            #(Some(gate_element))
+        }
+    }
+    .into_any()
 }
 
 #[cfg(test)]
 mod setup_screens_snapshot_tests {
     use super::*;
     use crate::utils::config::CustomApiKeyResponses;
-    use crate::utils::theme::ThemeName;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn api_key_needing_approval_keeps_the_key_as_set() {
+        // CC Onboarding.tsx:132-138: `normalizeApiKeyForConfig` of the raw
+        // value, as auth later matches it; only an empty value is absent.
+        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _homespace = crate::utils::env_utils::EnvVarGuard::unset("COO_RUNNING_ON_HOMESPACE");
+        let config = GlobalConfig::default();
+        let with_key = |value: &'static str| {
+            move |key: &str| (key == "ANTHROPIC_API_KEY").then(|| value.to_string())
+        };
+        assert_eq!(
+            api_key_needing_onboarding_approval(&config, &with_key("sk-ant-test-key\r")),
+            Some(normalize_api_key_for_config("sk-ant-test-key\r"))
+        );
+        assert_eq!(api_key_needing_onboarding_approval(&config, &with_key("")), None);
+    }
 
     #[test]
     fn setup_screens_snapshot_matches_official_onboarding_gate_and_api_key_step() {
@@ -520,7 +585,6 @@ mod setup_screens_snapshot_tests {
             runtime_env::Platform::MacOS,
         );
         assert!(!completed.show_onboarding);
-        assert_eq!(completed.theme_name, Some(ThemeName::Dark));
         assert!(!completed.offer_terminal_setup);
 
         let with_new_key = setup_screens_snapshot_from_readonly_runtime(

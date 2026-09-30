@@ -31,6 +31,9 @@ pub struct TextInputProps<'a> {
     /// This is not a CC TextInput prop and leaves other input/navigation alone.
     pub escape_event_passthrough: bool,
     pub select_navigation_passthrough: bool,
+    /// Native transport for CC listener registration order; not a CC
+    /// TextInput prop. See `UseTextInputOptions::preceding_keybinding_contexts`.
+    pub preceding_keybinding_contexts: Vec<crate::keybindings::types::ContextName>,
     pub show_cursor: bool,
     pub placeholder: Option<String>,
     pub argument_hint: Option<String>,
@@ -89,6 +92,7 @@ pub fn TextInput<'a>(
             cancel_passthrough: props.select_navigation_passthrough,
             escape_event_passthrough: props.escape_event_passthrough,
             select_navigation_passthrough: props.select_navigation_passthrough,
+            preceding_keybinding_contexts: props.preceding_keybinding_contexts.clone(),
             value,
             cursor_offset,
             inline_ghost_text: None,
@@ -112,7 +116,7 @@ pub fn TextInput<'a>(
             HistoryDirection::Down => (props.on_history_down)(()),
         }
     }
-    if state.exit.should_exit() {
+    if state.exit.take_should_exit() {
         (props.on_exit)(());
     }
 
@@ -198,8 +202,9 @@ mod tests {
     fn text_input_escape_passthrough_preserves_nonempty_ctrl_c_editing() {
         // CC useTextInput.ts:108-120 handles Ctrl+C independently of the
         // BaseTextInput → parent Escape propagation restored for rule input.
-        // The real runtime has no parent app:interrupt handler here, so the
-        // text-level branch runs within the normal provider/focus environment.
+        // The real runtime has no parent handler for Ctrl+C's action here, so
+        // the text-level branch runs within the normal provider/focus
+        // environment.
         use futures::StreamExt;
         futures::executor::block_on(async {
             let (keys, events) = async_channel::unbounded();

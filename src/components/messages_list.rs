@@ -15,6 +15,8 @@ use crate::utils::classifier_approvals::{ClassifierApprovalsState, ClassifierChe
 use crate::utils::collapse_read_search::collapse_read_search_groups;
 use crate::utils::debug::component_profile_enabled;
 use crate::utils::status_notice_definitions::{StatusNoticeContext, get_active_notices};
+use crate::components::offscreen_freeze::OffscreenFreeze;
+use crate::utils::theme::ThemeName;
 use iocraft::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1159,6 +1161,20 @@ fn messages_memo_key(
     )
 }
 
+/// Memo payload for a tool-use id set: sorted, so equality is set equality
+/// and the `Debug` text feeding the `message-rows` Memo is deterministic.
+///
+/// Maps to: CC `Messages.tsx:1030-1036` `setsEqual`, which the `Messages`
+/// comparator applies to `inProgressToolUseIDs` (`:1064-1068`). CC compares
+/// `streamingToolUses` per element by `contentBlock` (`:1054-1063`); the port's
+/// prop is already reduced to the id set (`:690`), so the set is what can be
+/// compared here.
+fn tool_use_id_set_memo_key(ids: &HashSet<String>) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().cloned().collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// iocraft L1 comparator payload for the extracted `MessageRows` subtree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MessageRowsMemoKey {
@@ -1179,6 +1195,15 @@ struct MessageRowsMemoKey {
     can_animate: bool,
     classifier_checking_tool_use_id: Option<String>,
     classifier_checking_is_auto: bool,
+    /// Every row's `isQueued`/`isStreaming` reads these (CC `Messages.tsx:829`
+    /// and the row's `streamingToolUseIDs`), so a set change alone must get
+    /// past this boundary — see [`tool_use_id_set_memo_key`].
+    in_progress_tool_use_ids: Vec<String>,
+    streaming_tool_use_ids: Vec<String>,
+    /// CC re-renders themed rows past `React.memo` when the ThemeProvider
+    /// value changes; iocraft reads context only in an update, so the theme
+    /// must get past this boundary itself.
+    theme: ThemeName,
     /// CC has no `MessageRows` component — this memo boundary is a port L1
     /// extraction of `renderableMessages.flatMap(renderMessageRow)`, so it must
     /// carry every term CC's enclosing `Messages` comparator carries, `tools`
@@ -1200,7 +1225,10 @@ fn message_rows_memo_key(
     columns: u16,
     classifier_checking_tool_use_id: Option<&str>,
     classifier_checking_is_auto: bool,
+    in_progress_tool_use_ids: &HashSet<String>,
+    streaming_tool_use_ids: &HashSet<String>,
     tools: &[crate::types::tools::Tool],
+    theme: ThemeName,
 ) -> MessageRowsMemoKey {
     MessageRowsMemoKey {
         render_range: None,
@@ -1227,6 +1255,9 @@ fn message_rows_memo_key(
         can_animate: true,
         classifier_checking_tool_use_id: classifier_checking_tool_use_id.map(str::to_string),
         classifier_checking_is_auto,
+        in_progress_tool_use_ids: tool_use_id_set_memo_key(in_progress_tool_use_ids),
+        streaming_tool_use_ids: tool_use_id_set_memo_key(streaming_tool_use_ids),
+        theme,
     }
 }
 
@@ -1254,6 +1285,8 @@ struct MessageRowsProps {
     pub streaming_tool_use_ids: Arc<HashSet<String>>,
     /// Maps to: CC `Messages.tsx:822` `tools={tools}` on each `MessageRow`.
     pub tools: Arc<Vec<crate::types::tools::Tool>>,
+    /// The resolved theme MessagesImpl rendered under, for the memo keys.
+    pub theme: ThemeName,
 }
 
 #[derive(Default)]
@@ -1292,7 +1325,10 @@ impl Component for MessageRows {
             props.columns,
             props.classifier_checking_tool_use_id.as_deref(),
             props.classifier_checking_is_auto,
+            &props.in_progress_tool_use_ids,
+            &props.streaming_tool_use_ids,
             &props.tools,
+            props.theme,
         );
 
         next_key.render_range = props.render_range;
@@ -1303,7 +1339,12 @@ impl Component for MessageRows {
         // props, so the retained row subtree is reused without rebuilding rows
         // or dirtying layout. While loading, keep entering rows so dynamic
         // in-progress rows can be gated individually by MessageRow/OffscreenFreeze.
-        if !props.is_loading && self.last_key.as_ref() == Some(&next_key) {
+        // A row's own AppState subscription still gets through (Contract D:
+        // a manual bailout checks `children_have_pending_change`).
+        if !props.is_loading
+            && self.last_key.as_ref() == Some(&next_key)
+            && !updater.children_have_pending_change()
+        {
             if let Some(start) = profile_start {
                 let elapsed = start.elapsed();
                 if elapsed >= Duration::from_millis(5) {
@@ -1357,6 +1398,7 @@ impl Component for MessageRows {
         let in_progress_tool_use_ids = Arc::clone(&props.in_progress_tool_use_ids);
         let streaming_tool_use_ids = Arc::clone(&props.streaming_tool_use_ids);
         let tools = Arc::clone(&props.tools);
+        let theme = props.theme;
         let rendered_count = end.saturating_sub(start);
 
         updater.update_children(
@@ -1389,6 +1431,7 @@ impl Component for MessageRows {
                     columns,
                     &in_progress_tool_use_ids,
                     &streaming_tool_use_ids,
+                    theme,
                 );
                 let is_static = static_memo_key.is_some();
                 let memo_key = static_memo_key
@@ -1485,8 +1528,14 @@ struct MessagesMemoKey {
     classifier_checking_tool_use_id: Option<String>,
     classifier_checking_is_auto: bool,
     streaming_text: Option<String>,
+    /// CC `Messages.tsx:1054-1068` — see [`tool_use_id_set_memo_key`].
+    in_progress_tool_use_ids: Vec<String>,
+    streaming_tool_use_ids: Vec<String>,
     /// CC `Messages.tsx:1079-1087` — see [`tool_pool_memo_key`].
     tool_pool: String,
+    /// Not a CC comparator term: React re-renders a context consumer past
+    /// `React.memo` (ThemeProvider.tsx:136), which iocraft does not.
+    theme: ThemeName,
 }
 
 #[derive(Default)]
@@ -1605,6 +1654,7 @@ impl Component for MessagesImpl {
         );
         let prepare_elapsed = prepare_start.map(|start| start.elapsed());
         let (terminal_cols, _) = hooks.use_terminal_size();
+        let (theme_name, _) = crate::components::design_system::theme_provider::use_theme(&hooks);
         // Cometix display prefs live in AppState (Config preview). The
         // store-absent fallbacks recorded here on 2026-08-01 are gone:
         // retained Messages always mounts under AppStateProvider, and the
@@ -1635,12 +1685,21 @@ impl Component for MessagesImpl {
             classifier_checking_tool_use_id: props.classifier_checking_tool_use_id.clone(),
             classifier_checking_is_auto: props.classifier_checking_is_auto,
             streaming_text: props.streaming_text.clone(),
+            in_progress_tool_use_ids: tool_use_id_set_memo_key(&props.in_progress_tool_use_ids),
+            streaming_tool_use_ids: tool_use_id_set_memo_key(&props.streaming_tool_use_ids),
             tool_pool: tool_pool_memo_key(&props.tools),
+            theme: theme_name,
         };
 
         // Match official `Messages = React.memo(...)`: prompt-only frames keep
-        // the message subtree mounted without touching layout or children.
-        if !props.is_loading && self.last_key.as_ref() == Some(&next_key) {
+        // the message subtree mounted without touching layout or children —
+        // except that a descendant's own AppState subscription still gets
+        // through, as React re-renders a subscriber past a memoized ancestor
+        // (Contract D: a manual bailout checks `children_have_pending_change`).
+        if !props.is_loading
+            && self.last_key.as_ref() == Some(&next_key)
+            && !updater.children_have_pending_change()
+        {
             if let Some(start) = profile_start {
                 let elapsed = start.elapsed();
                 if elapsed >= Duration::from_millis(5) {
@@ -1675,7 +1734,9 @@ impl Component for MessagesImpl {
             // CC React.memo compares LogoHeader props only. Terminal width is
             // deliberately absent: LogoV2's own terminal-size hook invalidates
             // its child subtree without dirtying the header from parent frames.
-            let logo_memo_key = format!("logo-header:{status_notice_context:?}");
+            // The theme is here because React re-renders a context consumer
+            // past the memo and iocraft does not.
+            let logo_memo_key = format!("logo-header:{theme_name:?}:{status_notice_context:?}");
             children.push(
                 element! {
                     Memo(key: "logo-header".to_string(), memo_key: logo_memo_key, compare: memo_key_eq as MemoComparator) {
@@ -1754,7 +1815,10 @@ impl Component for MessagesImpl {
             terminal_cols,
             props.classifier_checking_tool_use_id.as_deref(),
             props.classifier_checking_is_auto,
+            &props.in_progress_tool_use_ids,
+            &props.streaming_tool_use_ids,
             &props.tools,
+            theme_name,
         );
         rows_key.can_animate = can_animate;
         let rows_memo_key = format!("{:?}:{:?}", props.render_range, rows_key);
@@ -1780,6 +1844,7 @@ impl Component for MessagesImpl {
                             // CC `Messages.tsx:822` `tools={tools}` — the row
                             // map is this component in the port's L1 split.
                             tools: Arc::clone(&props.tools),
+                            theme: theme_name,
                         )
                     }
                 }
@@ -2290,6 +2355,457 @@ mod tests {
                 },
             )),
             ..Default::default()
+        }
+    }
+
+    #[derive(Default, Props)]
+    struct PendingWorkerRequestFlipProbeProps {
+        pub store: Option<crate::state::store::AppStore>,
+    }
+
+    /// A sibling subscriber whose text always changes with the probe's write,
+    /// so that write is guaranteed to produce a frame whether or not the tool
+    /// row updates.
+    #[component]
+    fn VerboseEcho(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let verbose =
+            crate::state::app_state::use_app_state(&mut hooks, |state| state.verbose);
+        element! { Text(content: format!("verbose={verbose}")) }
+    }
+
+    /// A running tool row while the worker waits on it. The test drives the
+    /// store from outside between captured frames, so Messages' props and the
+    /// idle `is_loading` never change and every memo above the row bails.
+    #[component]
+    fn PendingWorkerRequestFlipProbe(
+        props: &PendingWorkerRequestFlipProbeProps,
+        mut hooks: Hooks,
+    ) -> impl Into<AnyElement<'static>> {
+        let store = props.store.clone().expect("probe store");
+        let messages = hooks.use_const(|| {
+            Arc::new(vec![tool_use_named_with_input(
+                "assistant-tool",
+                "toolu_1",
+                "Bash",
+                None,
+                "echo permission-gated",
+            )])
+        });
+        let in_progress = hooks.use_const(|| {
+            Arc::new(["toolu_1".to_string()].into_iter().collect::<HashSet<_>>())
+        });
+        let current_theme = *theme::current();
+        element! {
+            ContextProvider(value: Context::owned(current_theme)) {
+                crate::state::app_state::AppStateProvider(
+                    prebuilt_store: Some(store),
+                    children: crate::state::app_state::ProviderChildren::new(move || element! {
+                        View(flex_direction: FlexDirection::Column) {
+                            Messages(
+                                messages: Arc::clone(&messages),
+                                is_loading: false,
+                                in_progress_tool_use_ids: Arc::clone(&in_progress),
+                            )
+                            VerboseEcho
+                        }
+                    }.into_any()),
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn messages_idle_tool_row_follows_a_pending_worker_request_store_write() {
+        // Contract D: the row's own AppState subscription gets past the
+        // MessagesImpl / MessageRows / MessageRow bailouts, as CC's
+        // `useSyncExternalStore` subscriber re-renders past memoized parents.
+        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = TestEnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let store = crate::state::store::AppStore::new(worker_waiting_on("toolu_1"), None);
+        // Frame-driven, no timers: take the mount frame, answer the worker
+        // request, then take the frame that write produces. The same write
+        // flips `verbose` for the sibling echo, so a frame always follows.
+        let (mounted, answered) = futures::executor::block_on(async {
+            let mut probe = element!(PendingWorkerRequestFlipProbe(store: Some(store.clone())));
+            let frames = probe
+                .mock_terminal_render_loop(MockTerminalConfig::default().with_size(100, 24));
+            futures::pin_mut!(frames);
+            let mounted = frames.next().await.expect("mount frame").to_string();
+            store.replace_with(|state| {
+                state.pending_worker_request = None;
+                state.verbose = true;
+            });
+            let mut answered = frames.next().await.expect("frame after the write").to_string();
+            // Settle past any intermediate frame to the one showing the write.
+            while !answered.contains("verbose=true") {
+                answered = frames.next().await.expect("frame showing the write").to_string();
+            }
+            (mounted, answered)
+        });
+        assert!(mounted.contains("Waiting for permission…"), "mount frame:\n{mounted}");
+        assert!(mounted.contains("verbose=false"), "mount frame:\n{mounted}");
+        assert!(!answered.contains("Waiting for permission…"), "frame after the write:\n{answered}");
+    }
+
+    #[derive(Default, Props)]
+    struct InProgressFlipMessagesProps {
+        pub is_loading: bool,
+    }
+
+    /// Messages whose only changing prop is `inProgressToolUseIDs`: the store's
+    /// `verbose` stands in for REPL's `setInProgressToolUseIDs` and picks one
+    /// of two fixed sets. Messages' own `verbose` prop stays at its default.
+    #[component]
+    fn InProgressFlipMessages(
+        props: &InProgressFlipMessagesProps,
+        mut hooks: Hooks,
+    ) -> impl Into<AnyElement<'static>> {
+        let started = crate::state::app_state::use_app_state(&mut hooks, |state| state.verbose);
+        let messages = hooks.use_const(|| {
+            Arc::new(vec![tool_use_named_with_input(
+                "assistant-tool",
+                "toolu_1",
+                "Bash",
+                None,
+                "echo queued-then-running",
+            )])
+        });
+        let queued = hooks.use_const(|| Arc::new(HashSet::new()));
+        let running = hooks.use_const(|| {
+            Arc::new(["toolu_1".to_string()].into_iter().collect::<HashSet<_>>())
+        });
+        let in_progress = if started { running } else { queued };
+        element! {
+            Messages(
+                messages: Arc::clone(&messages),
+                is_loading: props.is_loading,
+                in_progress_tool_use_ids: Arc::clone(&in_progress),
+            )
+        }
+    }
+
+    #[derive(Default, Props)]
+    struct InProgressFlipProbeProps {
+        pub store: Option<crate::state::store::AppStore>,
+        pub is_loading: bool,
+    }
+
+    #[component]
+    fn InProgressFlipProbe(props: &InProgressFlipProbeProps) -> impl Into<AnyElement<'static>> {
+        let store = props.store.clone().expect("probe store");
+        let is_loading = props.is_loading;
+        let current_theme = *theme::current();
+        element! {
+            ContextProvider(value: Context::owned(current_theme)) {
+                crate::state::app_state::AppStateProvider(
+                    prebuilt_store: Some(store),
+                    children: crate::state::app_state::ProviderChildren::new(move || element! {
+                        View(flex_direction: FlexDirection::Column) {
+                            InProgressFlipMessages(is_loading: is_loading)
+                            VerboseEcho
+                        }
+                    }.into_any()),
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn messages_tool_row_follows_an_in_progress_set_change_alone() {
+        // CC's Messages comparator re-renders when `inProgressToolUseIDs`
+        // stops being `setsEqual` (Messages.tsx:1064-1068), and the row's
+        // `isQueued` reads the set (AssistantToolUseMessage.tsx:121). Idle,
+        // the MessagesImpl bailout used to swallow the change; loading, the
+        // `message-rows` Memo did. Frame-driven: the same write flips the
+        // sibling echo, so a frame always follows.
+        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = TestEnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        for is_loading in [false, true] {
+            let store = crate::state::store::AppStore::new(Default::default(), None);
+            let (queued, started) = futures::executor::block_on(async {
+                let mut probe = element!(InProgressFlipProbe(
+                    store: Some(store.clone()),
+                    is_loading: is_loading,
+                ));
+                let frames = probe
+                    .mock_terminal_render_loop(MockTerminalConfig::default().with_size(100, 24));
+                futures::pin_mut!(frames);
+                let queued = frames.next().await.expect("mount frame").to_string();
+                store.replace_with(|state| state.verbose = true);
+                let mut started = frames.next().await.expect("frame after the write").to_string();
+                while !started.contains("verbose=true") {
+                    started = frames.next().await.expect("frame showing the write").to_string();
+                }
+                (queued, started)
+            });
+            assert!(
+                queued.contains("Waiting…"),
+                "is_loading={is_loading} mount frame:\n{queued}"
+            );
+            // The row itself must still be there, now Running (Bash renders
+            // "Running…", BashTool/UI.tsx), not merely gone.
+            assert!(
+                !started.contains("Waiting…") && started.contains("Running…"),
+                "is_loading={is_loading} frame after the set change:\n{started}"
+            );
+        }
+    }
+
+    /// Previews the light theme on `p`; every key bumps a visible count so a
+    /// frame always follows.
+    #[component]
+    fn PreviewLightOnKey(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let preview = crate::components::design_system::theme_provider::use_preview_theme(&hooks);
+        let mut presses = hooks.use_state(|| 0usize);
+        hooks.use_terminal_events(move |event| {
+            let TerminalEvent::Key(key) = event else {
+                return;
+            };
+            if key.kind != KeyEventKind::Press {
+                return;
+            }
+            presses.set(presses.get() + 1);
+            match key.code {
+                KeyCode::Char('p') => {
+                    preview.set_preview_theme(crate::utils::theme::ThemeSetting::Named(
+                        crate::utils::theme::ThemeName::Light,
+                    ))
+                }
+                KeyCode::Char('c') => preview.cancel_preview(),
+                _ => {}
+            }
+        });
+        element! { Text(content: format!("presses={}", presses.get())) }
+    }
+
+    #[derive(Default, Props)]
+    struct ThemeFlipProbeProps {
+        pub is_loading: bool,
+        pub show_logo: bool,
+    }
+
+    #[component]
+    fn ThemeFlipProbe(props: &ThemeFlipProbeProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        use crate::components::design_system::theme_provider::{ThemeProvider, ThemeSaveHandler};
+        let messages = hooks.use_const(|| Arc::new(vec![RenderableMessage::user("u1", "hello theme")]));
+        let is_loading = props.is_loading;
+        let hide_logo = !props.show_logo;
+        element! {
+            ThemeProvider(
+                initial_state: Some(crate::utils::theme::ThemeSetting::Named(theme::ThemeName::Dark)),
+                on_theme_save: Some(Arc::new(|_| {}) as ThemeSaveHandler),
+            ) {
+                crate::state::app_state::AppStateProvider(
+                    children: crate::state::app_state::ProviderChildren::new(move || element! {
+                        View(flex_direction: FlexDirection::Column) {
+                            Messages(messages: Arc::clone(&messages), is_loading: is_loading, hide_logo: hide_logo)
+                            PreviewLightOnKey
+                        }
+                    }.into_any()),
+                )
+            }
+        }
+    }
+
+    fn background_at(canvas: &iocraft::Canvas, needle: &str) -> Option<iocraft::Color> {
+        use unicode_width::UnicodeWidthStr;
+        let text = canvas.to_string();
+        let (y, line) = text.lines().enumerate().find(|(_, line)| line.contains(needle))?;
+        let x = line[..line.find(needle)?].width();
+        canvas.cell(x, y).and_then(|cell| cell.background_color)
+    }
+
+    #[test]
+    fn messages_rows_repaint_when_the_provider_previews_another_theme() {
+        // CC re-renders every themed descendant past `React.memo` when the
+        // ThemeProvider value changes (ThemeProvider.tsx:136). The user row
+        // is static, so it sits behind the MessagesImpl bailout (idle), the
+        // `message-rows` Memo (loading), its own static key and CachedSubtree;
+        // the theme name in those keys is what carries the change through.
+        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = TestEnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        for is_loading in [false, true] {
+            let (before, after) = futures::executor::block_on(async {
+                let (keys, events) = async_channel::unbounded();
+                let mut probe = element!(ThemeFlipProbe(is_loading: is_loading));
+                let mut render_loop = Box::pin(probe.mock_terminal_render_loop(
+                    MockTerminalConfig::with_events(events).with_size(100, 12),
+                ));
+                let mut before = None;
+                while let Some(canvas) = render_loop.next().await {
+                    let text = canvas.to_string();
+                    assert!(text.contains("presses="), "the probe stopped rendering:\n{text}");
+                    if before.is_none() && text.contains("presses=0") {
+                        before = Some(background_at(&canvas, "hello theme"));
+                        keys.send(TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char('p'))))
+                            .await
+                            .unwrap();
+                    } else if text.contains("presses=1") {
+                        return (before.flatten(), background_at(&canvas, "hello theme"));
+                    }
+                }
+                panic!("render loop ended early");
+            });
+            assert_eq!(before, Some(theme::DARK.user_message_bg), "is_loading={is_loading}");
+            assert_eq!(after, Some(theme::LIGHT.user_message_bg), "is_loading={is_loading}");
+        }
+    }
+
+    #[derive(Default, Props)]
+    struct TurnSummaryThemeProbeProps {
+        pub store: Option<crate::state::store::AppStore>,
+    }
+
+    #[component]
+    fn TurnSummaryThemeProbe(
+        props: &TurnSummaryThemeProbeProps,
+        mut hooks: Hooks,
+    ) -> impl Into<AnyElement<'static>> {
+        use crate::components::design_system::theme_provider::{ThemeProvider, ThemeSaveHandler};
+        use crate::types::message::{SystemBase, SystemMessage};
+        let store = props.store.clone().expect("probe store");
+        let messages = hooks.use_const(|| {
+            let base = SystemBase::new();
+            Arc::new(vec![RenderableMessage {
+                uuid: base.uuid.clone(),
+                kind: RenderableMessageKind::System(SystemMessage::TurnDuration {
+                    base,
+                    duration_ms: 5_000,
+                    budget_tokens: None,
+                    budget_limit: None,
+                    budget_nudges: None,
+                    message_count: None,
+                }),
+            }])
+        });
+        element! {
+            ThemeProvider(
+                initial_state: Some(crate::utils::theme::ThemeSetting::Named(theme::ThemeName::Dark)),
+                on_theme_save: Some(Arc::new(|_| {}) as ThemeSaveHandler),
+            ) {
+                crate::state::app_state::AppStateProvider(
+                    prebuilt_store: Some(store),
+                    children: crate::state::app_state::ProviderChildren::new(move || element! {
+                        View(flex_direction: FlexDirection::Column) {
+                            Messages(messages: Arc::clone(&messages), hide_logo: true)
+                            PreviewLightOnKey
+                        }
+                    }.into_any()),
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn messages_theme_preview_keeps_a_turn_summary_taken_at_mount() {
+        // CC's turn-duration row snapshots the running background tasks at
+        // mount (SystemTextMessage.tsx:352-357); a theme preview re-renders it
+        // in place, it does not remount it, so a task that has since finished
+        // still reads "still running" in that historical row.
+        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = TestEnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let store = crate::state::store::AppStore::new(Default::default(), None);
+        store.replace_with(|state| {
+            Arc::make_mut(&mut state.tasks).insert(
+                "agent-1".to_string(),
+                Arc::new(crate::state::app_state_store::TaskState::Other(
+                    crate::state::app_state_store::TaskStateOther {
+                        id: "agent-1".to_string(),
+                        task_type: "local_agent".to_string(),
+                        status: "running".to_string(),
+                        description: String::new(),
+                        is_backgrounded: Some(true),
+                        notified: false,
+                        retain: Some(false),
+                        evict_after: None,
+                        progress_tool_uses: None,
+                        progress_tokens: None,
+                    },
+                )),
+            );
+        });
+        let frames = futures::executor::block_on({
+            let store = store.clone();
+            async move {
+                let (keys, events) = async_channel::unbounded();
+                let mut probe = element!(TurnSummaryThemeProbe(store: Some(store.clone())));
+                let mut render_loop = Box::pin(probe.mock_terminal_render_loop(
+                    MockTerminalConfig::with_events(events).with_size(100, 12),
+                ));
+                let mut frames = Vec::new();
+                while let Some(canvas) = render_loop.next().await {
+                    let text = canvas.to_string();
+                    assert!(text.contains("presses="), "the probe stopped rendering:\n{text}");
+                    if !text.contains(&format!("presses={}", frames.len())) {
+                        continue;
+                    }
+                    frames.push(text);
+                    if frames.len() == 2 {
+                        break;
+                    }
+                    // The task finishes before the preview.
+                    store.replace_with(|state| {
+                        Arc::make_mut(&mut state.tasks).clear();
+                    });
+                    keys.send(TerminalEvent::Key(KeyEvent::new(
+                        KeyEventKind::Press,
+                        KeyCode::Char('p'),
+                    )))
+                    .await
+                    .unwrap();
+                }
+                frames
+            }
+        });
+        for frame in &frames {
+            assert!(
+                frame.contains("1 local agent still running"),
+                "the historical summary changed:\n{frame}"
+            );
+        }
+    }
+
+    fn foreground_at(canvas: &iocraft::Canvas, needle: &str) -> Option<iocraft::Color> {
+        use unicode_width::UnicodeWidthStr;
+        let text = canvas.to_string();
+        let (y, line) = text.lines().enumerate().find(|(_, line)| line.contains(needle))?;
+        let x = line[..line.find(needle)?].width();
+        canvas.cell(x, y).and_then(|cell| cell.text_style()).and_then(|style| style.color)
+    }
+
+    #[test]
+    fn messages_logo_follows_a_preview_and_its_cancel() {
+        // The logo's dim text previews light and returns to dark on cancel,
+        // as every themed descendant does under CC's ThemeProvider.
+        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = TestEnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let colors = futures::executor::block_on(async {
+            let (keys, events) = async_channel::unbounded();
+            let mut probe = element!(ThemeFlipProbe(show_logo: true));
+            let mut render_loop = Box::pin(probe.mock_terminal_render_loop(
+                MockTerminalConfig::with_events(events).with_size(120, 40),
+            ));
+            let mut colors = Vec::new();
+            let press = |c| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::Char(c)));
+            let keys_in_order = ['p', 'c'];
+            while let Some(canvas) = render_loop.next().await {
+                let text = canvas.to_string();
+                assert!(text.contains("presses="), "the probe stopped rendering:\n{text}");
+                if !text.contains(&format!("presses={}", colors.len())) {
+                    continue;
+                }
+                colors.push((foreground_at(&canvas, "Opus now defaults"), text));
+                let Some(key) = keys_in_order.get(colors.len() - 1) else {
+                    break;
+                };
+                keys.send(press(*key)).await.unwrap();
+            }
+            colors
+        });
+        let expected = [theme::DARK.inactive, theme::LIGHT.inactive, theme::DARK.inactive];
+        assert_eq!(colors.len(), expected.len());
+        for ((color, text), expected) in colors.iter().zip(expected) {
+            assert_eq!(*color, Some(expected), "canvas:\n{text}");
         }
     }
 
@@ -2965,7 +3481,10 @@ mod tests {
                 120,
                 classifier,
                 classifier_is_auto,
+                &HashSet::new(),
+                &HashSet::new(),
                 pool,
+                ThemeName::Dark,
             )
         };
         let baseline = key(&prepared, 0, false, None, false, &pool);
@@ -2988,6 +3507,25 @@ mod tests {
         // (`AgentTool/UI.tsx:1096-1098`).
         assert_eq!(baseline, key(&prepared, 0, false, None, false, &rebuilt_pool));
         assert_ne!(baseline, key(&prepared, 0, false, None, false, &narrowed_pool));
+        // CC Messages.tsx:1030-1036,1064-1068: the in-progress set compares by
+        // `setsEqual` — a rebuilt set with the same ids is equal whatever its
+        // iteration order, a set that gained an id is not. The streaming set
+        // is the same shape (`:690`).
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        let with_sets = |in_progress: &HashSet<String>, streaming: &HashSet<String>| {
+            message_rows_memo_key(
+                &prepared, 0, false, false, false, true, true, 120, None, false, in_progress,
+                streaming, &pool, ThemeName::Dark,
+            )
+        };
+        let running = with_sets(&ids(&["toolu_2", "toolu_1"]), &HashSet::new());
+        assert_ne!(baseline, running);
+        assert_eq!(running, with_sets(&ids(&["toolu_1", "toolu_2"]), &HashSet::new()));
+        assert_ne!(baseline, with_sets(&HashSet::new(), &ids(&["toolu_1"])));
+        // A theme change alone reaches the rows (see `MessageRowsMemoKey::theme`).
+        let mut light = key(&prepared, 0, false, None, false, &pool);
+        light.theme = ThemeName::Light;
+        assert_ne!(baseline, light);
     }
 
     #[test]
