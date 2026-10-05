@@ -30,6 +30,7 @@ use crate::types::permissions::{
     PermissionPromptChoice, PermissionPromptResponse, PermissionRequest,
 };
 use crate::utils::classifier_approvals::ClassifierChecking;
+use crate::utils::process_env::JsTruthy;
 use std::{sync::Arc, time::Duration};
 
 /// Maps to CC `query.ts` `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT`.
@@ -619,11 +620,7 @@ where
                 error: error_text.clone(),
                 error_details: Some(error_text.clone()),
             };
-            schedule_stop_failure_hooks_for_api_error(
-                system_error.clone(),
-                params.tool_use_context.tool_permission_context.clone(),
-                None,
-            );
+            schedule_stop_failure_hooks_for_api_error(system_error.clone(), None);
             let _ = event_tx.send(QueryEvent::ApiError(system_error)).await;
             let _ = send_assistant_api_error_message(&event_tx, &params.turn_id, &error_text).await;
             let mut terminal = transitions::Terminal::new("model_error");
@@ -2341,7 +2338,6 @@ where
 
                     schedule_stop_failure_hooks_for_api_error(
                         error.clone(),
-                        permission_context.clone(),
                         last_assistant_message.map(str::to_string),
                     );
                     let terminal_reason = terminal_reason_for_system_api_error(&error);
@@ -2699,7 +2695,6 @@ where
                 }
                 schedule_stop_failure_hooks_for_api_error(
                     error.clone(),
-                    permission_context.clone(),
                     last_assistant_text(&assistant_messages),
                 );
                 let _ = event_tx.send(QueryEvent::ApiError(error.clone())).await;
@@ -2791,7 +2786,6 @@ where
                 if let Some(error) = withheld_api_error.clone() {
                     schedule_stop_failure_hooks_for_api_error(
                         error.clone(),
-                        permission_context.clone(),
                         last_assistant_text(&assistant_messages),
                     );
                     let _ = event_tx.send(QueryEvent::ApiError(error.clone())).await;
@@ -4132,7 +4126,10 @@ fn should_escalate_max_output_tokens(current_override: Option<u32>) -> bool {
             crate::utils::feature_flags::FeatureFlag::MaxOutputTokensEscalation,
         ),
         current_override,
-        std::env::var_os("CLAUDE_CODE_MAX_OUTPUT_TOKENS").is_some(),
+        crate::utils::process_env::var_os("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+            .as_deref()
+            .truthy()
+            .is_some(),
     )
 }
 
@@ -5043,31 +5040,25 @@ fn terminal_reason_for_system_api_error(
 
 fn schedule_stop_failure_hooks_for_api_error(
     error: crate::types::message::SystemApiErrorMessage,
-    permission_context: ToolPermissionContext,
     last_assistant_message: Option<String>,
 ) {
     // Maps to CC `query.ts` `void executeStopFailureHooks(...)`: fire-and-forget.
     #[cfg(not(test))]
     {
         tokio::spawn(async move {
-            execute_stop_failure_hooks_for_api_error(
-                &error,
-                &permission_context,
-                last_assistant_message.as_deref(),
-            )
-            .await;
+            execute_stop_failure_hooks_for_api_error(&error, last_assistant_message.as_deref())
+                .await;
         });
     }
     #[cfg(test)]
     {
-        let _ = (error, permission_context, last_assistant_message);
+        let _ = (error, last_assistant_message);
     }
 }
 
 #[cfg(not(test))]
 async fn execute_stop_failure_hooks_for_api_error(
     error: &crate::types::message::SystemApiErrorMessage,
-    permission_context: &ToolPermissionContext,
     last_assistant_message: Option<&str>,
 ) {
     // CC `executeStopFailureHooks` passes `getAppState: toolUseContext?.getAppState`
@@ -5083,22 +5074,6 @@ async fn execute_stop_failure_hooks_for_api_error(
     if config.is_empty() {
         return;
     }
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
-    let hook_context = crate::services::hooks::HookContext {
-        cwd: cwd.clone(),
-        project_dir: cwd,
-        permission_mode: Some(
-            crate::utils::permissions::permission_mode::to_external_permission_mode(
-                permission_context.mode,
-            )
-            .to_string(),
-        ),
-        ..Default::default()
-    };
-    let base_env = crate::services::hooks::build_hook_env_vars(&hook_context);
     let error_match = if error.error.trim().is_empty() {
         "unknown"
     } else {
@@ -5109,7 +5084,7 @@ async fn execute_stop_failure_hooks_for_api_error(
         error_match,
         error.error_details.as_deref().or(Some(&error.api_error)),
         last_assistant_message,
-        base_env,
+        Vec::new(),
     )
     .await;
 }
@@ -5580,7 +5555,7 @@ fn redact_error_text(text: &str) -> String {
         "CLAUDE_CODE_OAUTH_TOKEN",
     ] {
         sanitized = sanitized.replace(key, "<redacted>");
-        if let Ok(secret) = std::env::var(key) {
+        if let Some(secret) = crate::utils::process_env::var(key) {
             let trimmed = secret.trim();
             if !trimmed.is_empty() {
                 sanitized = sanitized.replace(trimmed, "<redacted>");
@@ -5787,6 +5762,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     /// Wall-clock ceiling for "the actor must terminate", not a latency
     /// assertion.
@@ -5961,7 +5937,6 @@ mod tests {
         AssistantContent, RenderableMessageKind, ToolResultStatus, ToolUseProgressMessage,
         ToolUseStatus,
     };
-    use crate::utils::env_utils::EnvVarGuard;
 
     /// A2.3 test extractors: rows carry the real `AssistantMessage`; these read
     /// the row's first non-identity block the way the renderer does.
@@ -6172,7 +6147,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn prepare_call_model_messages_strips_signature_blocks_only_for_fallback_retry() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("NODE_ENV", "test");
         let messages = vec![crate::types::message::Message::Assistant(
             crate::types::message::AssistantMessage {
@@ -6263,7 +6238,7 @@ mod tests {
             }
         }
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _non_interactive = EnvVarGuard::unset("CLAUDE_CODE_NON_INTERACTIVE");
         let _cometix_non_interactive = EnvVarGuard::unset("COMETIX_NON_INTERACTIVE");
@@ -6682,7 +6657,7 @@ mod tests {
 
     #[test]
     fn query_actor_passes_task_budget_remaining_after_autocompact() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("NODE_ENV", "test");
 
         #[derive(Clone, Debug)]
@@ -6981,7 +6956,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn query_actor_retries_call_model_after_model_fallback_and_strips_signature_blocks() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("NODE_ENV", "test");
         crate::utils::process_env::set("ANTHROPIC_MODEL", "claude-primary-model");
 
@@ -7150,7 +7125,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn query_actor_retries_after_streaming_non_streaming_model_fallback_signal() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("NODE_ENV", "test");
         crate::utils::process_env::set("ANTHROPIC_MODEL", "claude-primary-model");
 
@@ -7349,7 +7324,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn query_actor_keeps_fallback_model_for_tool_result_continuation() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("NODE_ENV", "test");
         crate::utils::process_env::set("ANTHROPIC_MODEL", "claude-primary-model");
 
@@ -8045,7 +8020,7 @@ mod tests {
 
     #[test]
     fn build_call_model_request_matches_official_simple_prompt_then_caller_system_context() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CODE_SIMPLE", "1");
         let base_system_prompt = crate::constants::prompts::get_simple_system_prompt_if_enabled();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
@@ -8082,7 +8057,7 @@ mod tests {
 
     #[test]
     fn build_call_model_request_threads_non_interactive_session_like_official_options() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::bootstrap::state::set_is_interactive(true);
         crate::utils::process_env::remove("CLAUDE_CODE_NON_INTERACTIVE");
         let interactive_ctx =
@@ -8158,7 +8133,7 @@ mod tests {
     /// denied ones absent.
     #[test]
     fn build_call_model_request_assembles_the_deny_filtered_pool_when_the_seed_has_no_tools() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mcp_state = crate::state::app_state_store::McpState {
@@ -8218,7 +8193,7 @@ mod tests {
     /// Options field (`services/api/claude.ts:694`), kept for shape parity.
     #[test]
     fn build_call_model_request_forwards_the_seeded_pool_and_keeps_mcp_tools_write_only() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let permission_context = deny_rule_permission_context("mcp__untrusted");
@@ -8319,7 +8294,7 @@ mod tests {
 
     #[test]
     fn build_call_model_request_forwards_explicit_fast_mode_owner_state() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_DISABLE_FAST_MODE");
         let seeded = crate::tool::ToolUseContext::default().with_fast_mode(Some(true));
         let request = build_call_model_request(
@@ -8336,7 +8311,7 @@ mod tests {
 
     #[test]
     fn build_call_model_request_uses_runtime_plan_model_selection_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_MODEL", "opusplan");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_OPUS_MODEL", "default-opus");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "default-sonnet");
@@ -8819,7 +8794,7 @@ mod tests {
 
     #[test]
     fn query_actor_withholds_prompt_too_long_for_context_collapse_before_surface() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CONTEXT_COLLAPSE", "1");
 
         #[derive(Clone, Debug)]
@@ -9346,7 +9321,7 @@ mod tests {
 
     #[test]
     fn query_loop_executes_post_sampling_hooks_after_model_response() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::hooks::post_sampling_hooks::clear_post_sampling_hooks();
 
         #[derive(Clone, Debug)]
@@ -10198,7 +10173,7 @@ mod tests {
 
     #[test]
     fn query_actor_preempts_model_call_at_blocking_limit() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _blocking_limit = EnvVarGuard::set("CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE", "10");
         let _disable_auto_compact = EnvVarGuard::set("DISABLE_AUTO_COMPACT", "1");
 
@@ -12343,7 +12318,7 @@ mod tests {
 
     #[test]
     fn query_actor_uses_injected_tool_permission_context_for_tool_flow() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
 
         #[derive(Clone, Debug)]
         struct PreallowedToolDeps {
@@ -12644,7 +12619,7 @@ mod tests {
 
     #[test]
     fn query_actor_preserves_original_edit_request_for_user_modified_response() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -13049,7 +13024,7 @@ mod tests {
 
     #[test]
     fn query_actor_todowrite_runs_without_permission_prompt() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         // Current CC enables TodoWrite only when TodoV2 is off. The Rust
         // bootstrap mapping uses this flag for a non-interactive legacy-todo
         // context; force-disable the explicit Task-tool override as well.
@@ -14061,7 +14036,7 @@ mod tests {
 
     #[test]
     fn query_actor_brief_tool_continuation_uses_official_model_ack_without_permission_prompt() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         // `USER_MSG_OPT_IN` seeds itself from `CLAUDE_CODE_BRIEF` on its first
         // read and never re-reads it (`bootstrap/state.rs:86-90`), so setting
         // the variable here only activated the tool while this test happened to
@@ -14480,6 +14455,7 @@ mod prompt_context_contract_tests {
     use crate::query::deps::{CallModelRequest, CallModelStreamFuture, QueryDeps};
     use crate::services::api::claude::QueryModelStreamItem;
     use crate::types::message::{AssistantContent, AssistantMessage, StopReason};
+    use crate::utils::test_env::{IsolatedProjectSettings, TEST_ENV_LOCK};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -14511,8 +14487,8 @@ mod prompt_context_contract_tests {
     /// model. `QueryConfig` (`query/config.ts:20-51`) is runtime state, not copy.
     #[test]
     fn query_context_matches_official_empty_and_explicit_values_without_runtime_gate_leaks() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _settings = IsolatedProjectSettings::pin();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14607,6 +14583,7 @@ mod permission_request_resolution_tests {
         AssistantContent, AssistantMessage, Message, StopReason, UserContent,
     };
     use crate::types::permissions::{PermissionRuleSource, PermissionRuleValue};
+    use crate::utils::test_env::TEST_ENV_LOCK;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug)]
@@ -14663,7 +14640,7 @@ mod permission_request_resolution_tests {
     async fn serial_query_permission_request_hook_resolution_matches_official() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _environment = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _environment = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let fixture = PermissionRequestFixture::new("1");
         fixture.install_hooks(true);

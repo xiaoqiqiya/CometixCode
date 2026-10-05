@@ -138,7 +138,7 @@ fn hex_component(hex: &str) -> f64 {
 /// bg 0–6 and 8 are dark, 7 and 9–15 light.
 fn detect_from_color_fg_bg() -> Option<SystemTheme> {
     // `process.env` decodes lossily rather than dropping a non-UTF-8 value.
-    let colorfgbg = std::env::var_os("COLORFGBG")?.to_string_lossy().into_owned();
+    let colorfgbg = crate::utils::process_env::var_os("COLORFGBG")?.to_string_lossy().into_owned();
     if colorfgbg.is_empty() {
         return None;
     }
@@ -198,7 +198,7 @@ fn js_number(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn theme_from_osc_color_reads_xparsecolor_forms_by_luminance() {

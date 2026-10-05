@@ -357,23 +357,18 @@ fn EnableAutoUpdatesSelect<'a>(
 }
 
 fn auto_updates_disabled_env_var() -> Option<&'static str> {
-    if crate::utils::env_utils::is_env_truthy(std::env::var("DISABLE_AUTOUPDATER").ok().as_deref())
+    if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("DISABLE_AUTOUPDATER").as_deref())
     {
         Some("DISABLE_AUTOUPDATER")
     } else if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_AUTOUPDATER")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_AUTOUPDATER")
             .as_deref(),
     ) {
         Some("CLAUDE_CODE_DISABLE_AUTOUPDATER")
-    } else if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
-            .ok()
-            .as_deref(),
-    ) {
-        Some("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
     } else {
-        None
+        // CC `config.ts:1742` `getEssentialTrafficOnlyReason()`: a plain
+        // truthiness test, not `isEnvTruthy`.
+        crate::utils::privacy_level::get_essential_traffic_only_reason()
     }
 }
 
@@ -1418,8 +1413,8 @@ pub fn Config<'a>(props: &mut ConfigProps<'a>, mut hooks: Hooks) -> impl Into<An
 mod tests {
     use super::*;
     use crate::utils::config::GlobalConfig;
-    use crate::utils::env_utils::EnvVarGuard;
     use crate::utils::settings::types::SettingsJson;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK, TestEnvLock};
     use crate::utils::theme::{self, ThemeName};
     use futures::{StreamExt, stream};
     use std::fs;
@@ -1987,10 +1982,10 @@ mod tests {
         .join("\n")
     }
 
-    fn env_lock() -> &'static crate::utils::env_utils::TestEnvLock {
+    fn env_lock() -> &'static TestEnvLock {
         // Share the crate-wide env test lock: settings/items tests mutate the
         // same auto-update env variables and must serialize across modules.
-        &crate::utils::env_utils::TEST_ENV_LOCK
+        &TEST_ENV_LOCK
     }
 
     struct CurrentDirGuard {
@@ -3214,7 +3209,7 @@ mod tests {
         // picker's `theme:toggleSyntaxHighlighting` (its context outranks
         // Global's `app:toggleTodos`), and the toggle writes user settings,
         // so the config dir is a throwaway one.
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
@@ -3678,7 +3673,7 @@ mod tests {
         // executed in consumer-search-peer-oracle.json. Meta+Backspace on an
         // empty query stays active; C/D passthrough leaves query untouched;
         // Up invokes focusHeader without clearing query or committing search.
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let (sender, receiver) = async_channel::unbounded();
         let mut app = element! { ConfigSearchPeerHarness };
         let mut frames = Box::pin(app.mock_terminal_render_loop(

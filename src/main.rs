@@ -35,6 +35,7 @@ use crate::state::store::AppStore;
 use crate::utils;
 use crate::utils::config::check_has_trust_dialog_accepted;
 use crate::utils::config::load_global_config;
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::get_settings_with_errors;
 use crate::utils::settings::{
     SettingSource, SettingsWithErrors, has_skip_dangerous_mode_permission_prompt,
@@ -84,9 +85,7 @@ fn resolve_agent_launch(
 ) -> ResolvedAgentLaunch {
     let cwd = bootstrap::state::get_original_cwd();
     let definitions = Arc::new(
-        crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides_readonly(
-            &cwd,
-        ),
+        crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides(&cwd),
     );
     let setting = cli.agent.as_deref().or(settings.agent.as_deref());
     let main_thread_agent_definition = setting.and_then(|setting| {
@@ -149,9 +148,7 @@ fn resolve_thinking_launch(
         _ => {
             // Maps to: CC MAX_THINKING_TOKENS env (truthy) ?? options.maxThinkingTokens.
             // Invalid non-empty env parses to NaN and blocks CLI fallback.
-            let env_max = std::env::var("MAX_THINKING_TOKENS")
-                .ok()
-                .filter(|value| !value.is_empty());
+            let env_max = crate::utils::process_env::var("MAX_THINKING_TOKENS").truthy();
             let max_thinking_tokens = match env_max.as_deref() {
                 Some(value) => parse_js_decimal_i64(value),
                 None => cli
@@ -206,6 +203,7 @@ fn build_interactive_launch_with_system_prompts(
 ) -> anyhow::Result<InteractiveLaunch> {
     let thinking = resolve_thinking_launch(settings, cli);
     let agents = resolve_agent_launch(settings, cli);
+    apply_launch_model_override(cli, &agents);
     let initial_state = build_initial_app_state_with_thinking(
         settings,
         settings_errors,
@@ -242,6 +240,68 @@ pub fn build_initial_app_state(
     Ok(build_interactive_launch(settings, settings_errors, workspace_trusted, cli)?.initial_state)
 }
 
+/// The headless store's `AppState` (CC `main.tsx:3701-3731`
+/// `headlessInitialState`). It leaves the main-loop override alone: headless
+/// launch wrote it before `runHeadless` ([`apply_headless_launch_model`]),
+/// and control requests may have moved it since.
+pub(crate) fn build_headless_initial_app_state(
+    settings: &SettingsJson,
+    settings_errors: &[ValidationError],
+    workspace_trusted: bool,
+    cli: &crate::cli::CliConfig,
+) -> anyhow::Result<AppState> {
+    let thinking = resolve_thinking_launch(settings, cli);
+    let agents = resolve_agent_launch(settings, cli);
+    build_initial_app_state_with_thinking(
+        settings,
+        settings_errors,
+        workspace_trusted,
+        cli,
+        thinking.enabled,
+        &agents,
+    )
+}
+
+/// Maps to: CC `main.tsx:2941,3052-3071`: only an explicit CLI model or a
+/// non-inherit main-thread agent model becomes the runtime override, and the
+/// launch model is captured. Leaving the override undefined is significant
+/// because ANTHROPIC_MODEL and saved settings must remain eligible in
+/// `getUserSpecifiedModelSetting()`. Returns CC's `effectiveModel`.
+fn apply_launch_model_override(
+    cli: &crate::cli::CliConfig,
+    agents: &ResolvedAgentLaunch,
+) -> Option<String> {
+    let effective_model = match cli.model.as_deref() {
+        Some("default") => Some(crate::utils::model::model::get_default_main_loop_model()),
+        Some(model) => Some(model.to_string()),
+        None => agents
+            .main_thread_agent_definition
+            .as_ref()
+            .and_then(|agent| agent.model.as_deref())
+            .filter(|model| *model != "inherit")
+            .map(crate::utils::model::model::parse_user_specified_model),
+    };
+    crate::bootstrap::state::set_main_loop_model_override(effective_model.clone().map(Some));
+    // Maps to: CC `main.tsx:3068`
+    // `setInitialMainLoopModel(getUserSpecifiedModelSetting() || null)` — `||`
+    // rather than `??`, so an empty setting is captured as unset.
+    crate::bootstrap::state::set_initial_main_loop_model(
+        crate::utils::model::model::get_user_specified_model_setting()
+            .filter(|model| !model.is_empty()),
+    );
+    effective_model
+}
+
+/// [`apply_launch_model_override`] for the headless launch, before
+/// `runHeadless`. The result is `runHeadless`'s `userSpecifiedModel`
+/// (`main.tsx:3928,3952`).
+pub(crate) fn apply_headless_launch_model(
+    settings: &SettingsJson,
+    cli: &crate::cli::CliConfig,
+) -> Option<String> {
+    apply_launch_model_override(cli, &resolve_agent_launch(settings, cli))
+}
+
 fn build_initial_app_state_with_thinking(
     settings: &SettingsJson,
     settings_errors: &[ValidationError],
@@ -256,28 +316,8 @@ fn build_initial_app_state_with_thinking(
     // Maps to: CC AppStateStore.ts:469 `settings: getInitialSettings()`.
     initial.settings = std::sync::Arc::new(settings.clone());
 
-    // Maps to: CC `main.tsx:2941,3052-3071`: only an explicit CLI model or
-    // non-inherit main-thread agent model becomes the runtime override. Leaving
-    // the override undefined is significant because ANTHROPIC_MODEL and saved
-    // settings must remain eligible in `getUserSpecifiedModelSetting()`.
-    let effective_model_override = match cli.model.as_deref() {
-        Some("default") => Some(crate::utils::model::model::get_default_main_loop_model()),
-        Some(model) => Some(model.to_string()),
-        None => agents
-            .main_thread_agent_definition
-            .as_ref()
-            .and_then(|agent| agent.model.as_deref())
-            .filter(|model| *model != "inherit")
-            .map(crate::utils::model::model::parse_user_specified_model),
-    };
-    crate::bootstrap::state::set_main_loop_model_override(effective_model_override.map(Some));
-    // Maps to: CC `main.tsx:3068`
-    // `setInitialMainLoopModel(getUserSpecifiedModelSetting() || null)` — `||`
-    // rather than `??`, so an empty setting is captured as unset.
-    crate::bootstrap::state::set_initial_main_loop_model(
-        crate::utils::model::model::get_user_specified_model_setting()
-            .filter(|model| !model.is_empty()),
-    );
+    // The launch model override is already in place
+    // ([`apply_launch_model_override`]).
     initial.main_loop_model = crate::utils::model::model::get_user_specified_model_setting();
     // Maps to CC `main.tsx` initial AppState projection through
     // `getInitialAdvisorSetting()`. The feature gate intentionally keeps this
@@ -418,8 +458,7 @@ fn build_initial_app_state_with_thinking(
         crate::bootstrap::state::get_is_non_interactive_session(),
         crate::utils::agent_swarms_enabled::is_agent_swarms_enabled()
             && crate::utils::teammate::is_teammate(),
-        std::env::var("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION")
             .as_deref(),
     );
     // Maps to: CC main.tsx initialState notifications seeding.
@@ -666,11 +705,15 @@ pub fn register_mcp_connection_handlers(store: &AppStore) {
 
 /// Start the process-wide settings change detector.
 ///
-/// Maps to: CC `main.tsx:689` `void settingsChangeDetector.initialize()` — a
-/// launch-phase call, because the detector is a process-wide notifier. The
-/// AppState side of it is the Provider-scoped subscription
-/// (`AppState.tsx:104-110`), which keeps one fan-out with a single cache reset
-/// per change.
+/// Maps to: CC `main.tsx:689` `void settingsChangeDetector.initialize()`,
+/// inside `startDeferredPrefetches()`. In interactive mode CC calls that from
+/// `renderAndRun` (`interactiveHelpers.tsx:142`), after `showSetupScreens`, so
+/// the detector starts once setup and trust are done. The call sits in the
+/// retained setup phase's completion (`Main`). Started any earlier, an
+/// external settings edit during onboarding would fan out, and re-apply the
+/// settings env, before trust. The AppState side of it is the
+/// Provider-scoped subscription (`AppState.tsx:104-110`), which keeps one
+/// fan-out with a single cache reset per change.
 ///
 /// Everything else this function used to spawn moved to its mount at P5 G10,
 /// because each one is a mounted effect at the source and spawning it here
@@ -684,6 +727,13 @@ pub fn register_mcp_connection_handlers(store: &AppStore) {
 ///   also a functional fix: computing it once from a launch snapshot left the
 ///   status line stale for the whole session.
 pub fn start_settings_change_detector() {
+    // CC `startDeferredPrefetches` returns early in bare mode (`main.tsx:651-661`),
+    // and `initialize()` in remote mode (`changeDetector.ts:84`).
+    // `CLAUDE_CODE_EXIT_AFTER_FIRST_RENDER`, the other early return, is not
+    // ported.
+    if crate::utils::env_utils::is_bare_mode() || crate::bootstrap::state::get_is_remote_mode() {
+        return;
+    }
     #[cfg(not(test))]
     crate::utils::settings::change_detector::initialize();
 }
@@ -798,7 +848,8 @@ fn load_settings_from_flag(settings_value: &str) -> Result<(), String> {
             .take(16)
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let path = std::env::temp_dir().join(format!("claude-settings-{hash}.json"));
+        // CC `tempfile.ts:30` `join(tmpdir(), …)`.
+        let path = crate::utils::node_os::tmpdir().join(format!("claude-settings-{hash}.json"));
         std::fs::write(&path, trimmed)
             .map_err(|error| format!("Error processing --settings: {error}"))?;
         path
@@ -1070,6 +1121,9 @@ fn Main(props: &MainProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     // traffic starts only after setup/trust and remains off the
                     // retained frame.
                     crate::services::claude_ai_limits::spawn_quota_status_preflight();
+                    // CC `renderAndRun` → `startDeferredPrefetches()`
+                    // (`interactiveHelpers.tsx:142`, `main.tsx:689`): after setup.
+                    start_settings_change_detector();
                     setup_complete.set(true)
                 }
             },
@@ -1457,6 +1511,19 @@ pub fn run(config: crate::cli::CliConfig) {
     // before the render root exists; subsequent auth reads are memory hits.
     utils::secure_storage::keychain_prefetch::ensure_keychain_prefetch_completed();
     utils::managed_env::apply_safe_config_environment_variables();
+    // Maps to CC `entrypoints/init.ts:79`, before any TLS connection, then
+    // `:136-150`: load the mTLS configuration and the proxy agents.
+    utils::ca_certs_config::apply_extra_ca_certs_from_config();
+    // Node writes every `process.env` assignment to the real environment; the
+    // carrier does it this once, before the runtime and the background workers.
+    utils::process_env::publish_startup_environment();
+    utils::mtls::configure_global_mtls();
+    utils::proxy::configure_global_agents();
+    // CC `tools.ts:150-155` requires PowerShellTool lazily, at the first
+    // `getTools()` (`main.tsx:2755`): after `init()` applied the safe settings
+    // env and before the full apply. Its module-level
+    // `isBackgroundTasksDisabled` is evaluated at that point.
+    std::sync::LazyLock::force(&crate::tools::powershell_tool::IS_BACKGROUND_TASKS_DISABLED);
     // Maps to CC main.tsx:1273-1274 preAction; setup.ts:371 uses the same
     // idempotent sink entry. Run before subcommands and MCP startup producers.
     if let Err(error) = utils::sinks::init_sinks() {
@@ -1695,7 +1762,6 @@ pub fn run(config: crate::cli::CliConfig) {
                 .ok()
         });
         let render_result = rt.block_on(async {
-            start_settings_change_detector();
             // CC `createRoot(getBaseRenderOptions(false))` (main.tsx:6029,
             // :6149): `exitOnCtrlC: false`, so a Ctrl+C no handler takes does
             // nothing; exiting is the double press in useTextInput and
@@ -1810,7 +1876,6 @@ pub fn run(config: crate::cli::CliConfig) {
         );
     } else {
         let render_result = rt.block_on(async {
-            start_settings_change_detector();
             // `exitOnCtrlC: false`, as above.
             let result = mount()
                 .render_loop()
@@ -1847,6 +1912,7 @@ pub fn run(config: crate::cli::CliConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use futures::{StreamExt, stream};
     use std::fs;
     use std::time::Duration;
@@ -1868,7 +1934,7 @@ mod tests {
     struct MainProcessStateGuard {
         previous_cwd: std::path::PathBuf,
         previous_original_cwd: std::path::PathBuf,
-        previous_env: Vec<crate::utils::env_utils::EnvVarGuard>,
+        previous_env: Vec<EnvVarGuard>,
         root: std::path::PathBuf,
     }
 
@@ -1879,7 +1945,7 @@ mod tests {
                 previous_original_cwd: crate::bootstrap::state::get_original_cwd(),
                 previous_env: env_keys
                     .iter()
-                    .map(|key| crate::utils::env_utils::EnvVarGuard::preserve(key))
+                    .map(|key| EnvVarGuard::preserve(key))
                     .collect(),
                 root: root.to_path_buf(),
             };
@@ -1946,7 +2012,7 @@ mod tests {
             }
         }
 
-        let _lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _restore = LiveFlagStateRestore::capture();
         apply_live_startup_flags(&argv(&["--setting-sources", "user,local"])).unwrap();
         assert_eq!(
@@ -2069,7 +2135,7 @@ mod tests {
     fn main_completes_setup_before_direct_resume_session_start_hooks() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_guard = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let cwd = std::env::temp_dir().join(format!(
             "cometix-main-resume-order-{}",
             uuid::Uuid::new_v4()
@@ -2242,7 +2308,7 @@ mod tests {
 
     #[test]
     fn direct_uuid_resume_failure_renders_exit_with_error_and_requests_exit_one() {
-        let _env_guard = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-main-fatal-resume-{}",
             uuid::Uuid::new_v4()
@@ -2319,7 +2385,7 @@ mod tests {
 
     #[test]
     fn non_unique_cli_resume_value_opens_filtered_picker_after_setup() {
-        let _env_guard = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-main-resume-search-{}",
             uuid::Uuid::new_v4()
@@ -2451,7 +2517,7 @@ mod tests {
         let _backend_lock = utils::swarm::backends::registry::TEST_BACKEND_REGISTRY_LOCK
             .lock()
             .unwrap();
-        let _env_lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
         utils::teammate::clear_dynamic_team_context();
         utils::swarm::backends::teammate_mode_snapshot::reset_teammate_mode_snapshot_for_test();
@@ -2503,7 +2569,7 @@ mod tests {
 
     #[test]
     fn configure_teammate_from_cli_requires_identity_triplet_like_official() {
-        let _env_lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
         let error = configure_teammate_from_cli(&argv(&[
             "--agent-id",
@@ -2515,6 +2581,25 @@ mod tests {
 
         assert!(error.contains("--agent-id, --agent-name, and --team-name"));
         crate::utils::process_env::remove("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
+    }
+
+    #[test]
+    fn headless_initial_app_state_leaves_the_launch_override_alone() {
+        // CC `main.tsx:3701-3731` builds the headless store without touching
+        // the override `:3065` set; a control request may have moved it.
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = crate::bootstrap::state::get_main_loop_model_override();
+        let cli = crate::cli::parse_cli_config(&argv(&["--model", "sonnet"]));
+        crate::bootstrap::state::set_main_loop_model_override(Some(Some("moved".into())));
+        let state = build_headless_initial_app_state(&SettingsJson::default(), &[], true, &cli).unwrap();
+        assert_eq!(
+            crate::bootstrap::state::get_main_loop_model_override(),
+            Some(Some("moved".to_string()))
+        );
+        assert_eq!(state.main_loop_model.as_deref(), Some("moved"));
+        crate::bootstrap::state::set_main_loop_model_override(original);
     }
 
     #[test]
@@ -2561,10 +2646,9 @@ mod tests {
 
     #[test]
     fn initial_state_without_explicit_override_preserves_environment_model_precedence() {
-        let _env_guard = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_override = crate::bootstrap::state::get_main_loop_model_override();
-        let _model =
-            crate::utils::env_utils::EnvVarGuard::set("ANTHROPIC_MODEL", "claude-opus-4-6");
+        let _model = EnvVarGuard::set("ANTHROPIC_MODEL", "claude-opus-4-6");
         let settings = SettingsJson {
             model: Some("claude-haiku-4-5-20251001".to_string()),
             ..SettingsJson::default()
@@ -2603,7 +2687,7 @@ mod tests {
     /// captured as unset.
     #[test]
     fn startup_captures_the_launch_model_setting_like_official() {
-        let _env_guard = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_override = crate::bootstrap::state::get_main_loop_model_override();
         let previous_initial = crate::bootstrap::state::get_initial_main_loop_model();
         let root = std::env::temp_dir().join(format!(
@@ -2612,8 +2696,8 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("settings.json"), "{}").unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
-        let _model = crate::utils::env_utils::EnvVarGuard::unset("ANTHROPIC_MODEL");
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
+        let _model = EnvVarGuard::unset("ANTHROPIC_MODEL");
         utils::settings::settings_cache::reset_settings_cache();
 
         let agents = ResolvedAgentLaunch {
@@ -2624,6 +2708,7 @@ mod tests {
         };
         let launch = |cli: &crate::cli::CliConfig| {
             crate::bootstrap::state::set_initial_main_loop_model(Some("stale".to_string()));
+            apply_launch_model_override(cli, &agents);
             build_initial_app_state_with_thinking(
                 &SettingsJson::default(),
                 &[],
@@ -2675,6 +2760,10 @@ mod tests {
             main_thread_agent_definition: Some(agent.clone()),
         };
 
+        assert_eq!(
+            apply_launch_model_override(&crate::cli::CliConfig::default(), &agents).as_deref(),
+            Some(crate::utils::model::model::DEFAULT_SONNET_MODEL)
+        );
         let state = build_initial_app_state_with_thinking(
             &SettingsJson::default(),
             &[],
@@ -2784,7 +2873,7 @@ mod tests {
 
     #[test]
     fn build_interactive_launch_matches_official_default_thinking_setting() {
-        let _lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("MAX_THINKING_TOKENS");
         let cli = crate::cli::CliConfig::default();
 
@@ -2804,7 +2893,7 @@ mod tests {
 
     #[test]
     fn build_interactive_launch_matches_official_thinking_cli_precedence() {
-        let _lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("MAX_THINKING_TOKENS");
         let settings = SettingsJson::default();
         let cli = crate::cli::parse_cli_config(&argv(&["--max-thinking-tokens", "8000"]));
@@ -2831,7 +2920,7 @@ mod tests {
 
     #[test]
     fn build_interactive_launch_matches_official_env_budget_precedence() {
-        let _lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("MAX_THINKING_TOKENS", "4096tokens");
         let settings = SettingsJson::default();
         let cli = crate::cli::parse_cli_config(&argv(&["--max-thinking-tokens", "8000"]));
@@ -2923,7 +3012,7 @@ mod tests {
     /// the four legs exist to produce.
     #[test]
     fn apply_is_interactive_writes_the_official_state_slot() {
-        let _lock = utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _guard = crate::bootstrap::state::IsInteractiveGuard::capture();
 
         apply_is_interactive(&cli_args(&["-p", "hello"]), true);

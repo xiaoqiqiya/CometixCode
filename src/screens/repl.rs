@@ -3364,7 +3364,7 @@ fn resume(
             loaded.renderable_messages =
                 Arc::new(crate::utils::messages::normalize_messages(&loaded.messages));
             agent_definitions = Arc::new(
-                crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides_readonly(
+                crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides(
                     &crate::bootstrap::state::get_original_cwd(),
                 ),
             );
@@ -3870,8 +3870,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Maps to: CC `REPL.tsx:939-942` mount-time env gate.
     let terminal_title_disabled = hooks.use_const(|| {
         crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
-                .ok()
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
                 .as_deref(),
         )
     });
@@ -5652,9 +5651,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
                             // Maps to CC `QueryEngine.query()` eager/cowork
                             // result boundary.
-                            if crate::utils::env_utils::is_env_truthy(std::env::var(
-                                "CLAUDE_CODE_EAGER_FLUSH").ok().as_deref()) || crate::utils::env_utils::is_env_truthy(std::env::var(
-                                "CLAUDE_CODE_IS_COWORK").ok().as_deref()) {
+                            if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_EAGER_FLUSH").as_deref()) || crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_IS_COWORK").as_deref()) {
                                 if let Err(error) =
                                     crate::utils::session_storage::flush_session_storage().await
                                 {
@@ -10270,7 +10267,10 @@ mod tests {
         }
     }
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{
+        CLIPBOARD_OFF_SYSTEM, EnvVarGuard, IsolatedProjectSettings, PinnedProjectDir,
+        TEST_ENV_LOCK, TestEnvLock, in_child_process,
+    };
     use crate::utils::{conversation, conversation_recovery, theme};
     use futures::{Stream, StreamExt, stream};
     use serde_json::json;
@@ -10337,7 +10337,7 @@ mod tests {
     /// Maps to: CC replLauncher.tsx:24-26 props spread and REPL.tsx:6134-6138 manager.
     #[test]
     fn repl_props_into_element_preserves_mcp_startup_and_runs_non_strict_discovery() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_runtime::initialize_test_process_runtime();
         let runtime = crate::utils::process_runtime::runtime_handle_for_detached_work().unwrap();
         let _runtime = runtime.enter();
@@ -11596,7 +11596,7 @@ mod tests {
     fn fork_apply_matches_official_live_replacement_and_file_history_preservation() {
         // CC REPL.tsx:2548-2558 skips replacement reconstruction for Fork;
         // sessionRestore.ts:104-109 keeps fileHistory when log omits snapshots.
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let target = resume::ResumeTarget {
             session_id: Uuid::new_v4().to_string(),
             project_path: None,
@@ -11649,10 +11649,10 @@ mod tests {
     #[test]
     fn branch_command_matches_official_hot_resume_and_system_output() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _projects = crate::utils::session_storage::set_test_projects_dir_override(
             temp.path().join("projects"),
         );
@@ -11958,10 +11958,10 @@ mod tests {
     #[test]
     fn fork_resume_matches_official_worktree_metadata_and_live_file_history() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _no_hooks = EnvVarGuard::set("CLAUDE_CODE_SIMPLE", "1");
         struct RestoreSession {
             id: String,
@@ -12055,10 +12055,10 @@ mod tests {
 
     #[test]
     fn fork_resume_matches_official_session_end_then_explicit_target_start_identity() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         // Moving config/cwd away from just's trusted fixture removes its
         // persisted trust grant. Use the existing accepted-workspace fixture
@@ -12113,8 +12113,8 @@ mod tests {
 
     #[test]
     fn resume_runs_session_end_before_session_start_like_official_repl_callback() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let marker_path = std::env::temp_dir().join(format!(
             "cometix-repl-resume-hooks-{}",
             uuid::Uuid::new_v4()
@@ -13708,11 +13708,8 @@ mod tests {
     fn rewind_composer_matches_official_restore_and_edited_remount() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _checkpointing = crate::utils::env_utils::EnvVarGuard::set(
-            "CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING",
-            "0",
-        );
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _checkpointing = EnvVarGuard::set("CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING", "0");
         let entries = vec![
             json!({"type":"user","uuid":"rewind-first","timestamp":"2026-07-12T00:00:00.000Z","message":{"role":"user","content":"first prompt"}}),
             json!({"type":"user","uuid":"rewind-second","timestamp":"2026-07-12T00:00:01.000Z","message":{"role":"user","content":"<ide_selection>noise</ide_selection>\n<code>second</code>"}}),
@@ -13808,8 +13805,8 @@ mod tests {
     fn transcript_keybindings_toggle_cap_expand_and_return_to_prompt_matches_official_identity() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _fullscreen = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let prompt_path = "identity-fixture/verbose-only.rs";
         let absolute_path = crate::bootstrap::state::get_original_cwd()
             .join(prompt_path)
@@ -14211,8 +14208,8 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static crate::utils::env_utils::TestEnvLock {
-        &crate::utils::env_utils::TEST_ENV_LOCK
+    fn env_lock() -> &'static TestEnvLock {
+        &TEST_ENV_LOCK
     }
 
     struct OriginalCwdGuard {
@@ -14841,7 +14838,7 @@ mod tests {
         // Immediate completion schedules a notification on the same process
         // runtime that main publishes before mounting the actual REPL.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _no_flicker = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let _no_flicker = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let observer = PluginCompletionObserver::default();
         futures::executor::block_on(async {
             let mut app = element! { ContextProvider(value: Context::owned(observer.clone())) { ReplHarness } };
@@ -15257,8 +15254,8 @@ mod tests {
     }
 
     struct KeybindingsTestEnv {
-        config_dir: Option<crate::utils::env_utils::EnvVarGuard>,
-        write_enabled: Option<crate::utils::env_utils::EnvVarGuard>,
+        config_dir: Option<EnvVarGuard>,
+        write_enabled: Option<EnvVarGuard>,
         root: std::path::PathBuf,
     }
 
@@ -15274,14 +15271,8 @@ mod tests {
 
     fn install_keybindings_test_env(root: std::path::PathBuf) -> KeybindingsTestEnv {
         let restore = KeybindingsTestEnv {
-            config_dir: Some(crate::utils::env_utils::EnvVarGuard::set(
-                "CLAUDE_CONFIG_DIR",
-                &root,
-            )),
-            write_enabled: Some(crate::utils::env_utils::EnvVarGuard::set(
-                "COMETIX_WRITE_ENABLED",
-                "1",
-            )),
+            config_dir: Some(EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root)),
+            write_enabled: Some(EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1")),
             root: root.clone(),
         };
         crate::utils::config::clear_global_config_cache_for_testing();
@@ -15327,7 +15318,7 @@ mod tests {
     #[test]
     fn repl_keybindings_creates_official_template_off_frame_and_restores_prompt() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-repl-keybindings-{}", uuid::Uuid::new_v4()));
         let _restore = install_keybindings_test_env(root.clone());
@@ -15362,7 +15353,7 @@ mod tests {
     fn repl_stats_loads_real_transcript_aggregates_off_frame() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-repl-stats-{}", uuid::Uuid::new_v4()));
         write_stats_fixture(&root);
@@ -15383,20 +15374,30 @@ mod tests {
     fn repl_stats_escape_appends_official_system_display_result_and_restores_prompt() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-repl-stats-{}", uuid::Uuid::new_v4()));
         write_stats_fixture(&root);
         let _projects = crate::utils::session_storage::set_test_projects_dir_override(&root);
         let _cache =
             crate::utils::stats_cache::set_test_stats_cache_path(root.join("stats-cache.json"));
-        let mut events = text_input_events("/stats")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        events.push((key(KeyCode::Esc), 500));
-
-        let text = last_repl_text(timed_stream(events), 1_500, 40);
+        // Esc goes out only once the loaded panel is on screen: the stats
+        // load runs off the render thread, and an Esc that lands before the
+        // panel mounts is consumed by PromptInput instead.
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/stats")),
+                script_step(&["Overview", "Esc to cancel"], vec![key(KeyCode::Esc)]),
+                script_step(&["Stats dialog dismissed"], Vec::new()),
+            ],
+        );
+        let text = canvas_lines(
+            canvases
+                .last()
+                .expect("mock render should produce a final canvas"),
+        )
+        .join("\n");
 
         assert!(text.contains("/stats"), "canvas=\n{text}");
         assert!(text.contains("Stats dialog dismissed"), "canvas=\n{text}");
@@ -16731,50 +16732,20 @@ mod tests {
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
         let _write_guard = EnvVarGuard::set("COMETIX_WRITE_ENABLED", &PathBuf::from("0"));
 
-        let mut events = text_input_events("/status")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        // 300ms gap: under a saturated suite the render loop lags the event
-        // clock — Esc landing before the panel mounts means the dismissal
-        // output never appears (same class as the permissions tests).
-        events.push((key(KeyCode::Esc), 300));
-        let event_stream = stream::unfold(events.into_iter(), |mut events| async move {
-            let (event, delay_ms) = events.next()?;
-            if delay_ms > 0 {
-                futures_timer::Delay::new(Duration::from_millis(delay_ms)).await;
-            }
-            Some((event, events))
-        });
-        let canvases = futures::executor::block_on(async {
-            let mut app = element!(ReplHarness);
-            let mut render_loop = Box::pin(
-                app.mock_terminal_render_loop(MockTerminalConfig::with_events(event_stream)),
-            );
-            let mut canvases = Vec::new();
-            // Explicit settle: collect until the dismissal output lands (the
-            // terminal state this test asserts) instead of a silence window —
-            // the silence-settled collector truncates under load.
-            let deadline = std::time::Instant::now() + Duration::from_millis(10_000);
-            loop {
-                let settled = canvases
-                    .last()
-                    .map(|canvas| canvas_lines(canvas).join("\n"))
-                    .is_some_and(|text| text.contains("Status dialog dismissed"));
-                if settled || std::time::Instant::now() >= deadline {
-                    break;
-                }
-                let next = crate::utils::race(render_loop.next(), async {
-                    futures_timer::Delay::new(Duration::from_millis(100)).await;
-                    None
-                })
-                .await;
-                if let Some(canvas) = next {
-                    canvases.push(canvas);
-                }
-            }
-            canvases
-        });
+        // Esc goes out only once the Settings tab header is on screen: an Esc
+        // that lands before the panel mounts is consumed by PromptInput and
+        // the dismissal output never appears.
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/status")),
+                script_step(
+                    &["Settings", "Status", "Config", "Usage"],
+                    vec![key(KeyCode::Esc)],
+                ),
+                script_step(&["Status dialog dismissed"], Vec::new()),
+            ],
+        );
         let rendered = canvases
             .iter()
             .map(canvas_lines)
@@ -17121,7 +17092,7 @@ mod tests {
         // open, then drive the actual REPL, command dispatcher and Workspace UI.
         // No user prompt is submitted and no model actor is started.
         let _guard = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         for fullscreen in [false, true] {
             let _fullscreen =
                 EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", if fullscreen { "1" } else { "0" });
@@ -17309,7 +17280,7 @@ mod tests {
         // PermissionRuleInput Settings binding. Exercise the real REPL command
         // mount; an isolated input lacks the other live keybinding contexts.
         let _guard = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let mut app = element! {
             ContextProvider(value: Context::owned(
@@ -17370,7 +17341,7 @@ mod tests {
         // Ordinary processUserInput resumes its hook/query continuation, while
         // REPL.tsx's command shortcut ignores shouldQuery during an active query.
         let _guard = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let _title = EnvVarGuard::set("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1");
         let command = "echo permissions-retry-scout";
@@ -17754,7 +17725,7 @@ mod tests {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         // The fixture encodes the process cwd; the lookup reads the project
         // dir — pin them to the same root.
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-id-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -17809,7 +17780,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-title-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -17871,7 +17842,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home = std::env::temp_dir().join(format!(
             "cometix-repl-resume-title-ambiguous-{}",
             Uuid::new_v4()
@@ -17959,7 +17930,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-missing-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -18120,10 +18091,16 @@ mod tests {
 
     #[test]
     fn resume_cross_project_selection_appends_official_on_done_output_without_restoring() {
+        // iocraft reads the session's terminal from the OS environment.
+        if !in_child_process(
+            module_path!(),
+            "resume_cross_project_selection_appends_official_on_done_output_without_restoring",
+            CLIPBOARD_OFF_SYSTEM,
+        ) {
+            return;
+        }
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _ssh = EnvVarGuard::set("SSH_CONNECTION", "fixture");
-        let _tmux = EnvVarGuard::unset("TMUX");
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-cross-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -18338,8 +18315,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resume_pending_clipboard_matches_official_restore_first_settlement() {
+        // iocraft reads the session's terminal from the OS environment.
+        if !in_child_process(
+            module_path!(),
+            "resume_pending_clipboard_matches_official_restore_first_settlement",
+            &[
+                ("SSH_CONNECTION", Some("fixture")),
+                ("TMUX", Some("fixture")),
+            ],
+        ) {
+            return;
+        }
         let _guard = env_lock().lock().unwrap();
-        let _project = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project = PinnedProjectDir::at_manifest_root();
         crate::utils::process_runtime::initialize_test_process_runtime();
         for fail_restore in [false, true] {
             let directory =
@@ -18350,8 +18338,6 @@ mod tests {
                 directory.join("projects"),
             );
             let _write = EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
-            let _ssh = EnvVarGuard::set("SSH_CONNECTION", "fixture");
-            let _tmux = EnvVarGuard::set("TMUX", "fixture");
             let clipboard_input = Arc::new(std::sync::Mutex::new(None));
             let clipboard_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (release_clipboard, clipboard_completion) = futures::channel::oneshot::channel();
@@ -18676,10 +18662,10 @@ mod tests {
 
     #[test]
     fn terminal_setup_uses_official_on_done_null_transcript_path_without_panel() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _terminal = crate::utils::env_utils::EnvVarGuard::set("TERM", "xterm-kitty");
-        let _cursor = crate::utils::env_utils::EnvVarGuard::unset("CURSOR_TRACE_ID");
-        let _askpass = crate::utils::env_utils::EnvVarGuard::unset("VSCODE_GIT_ASKPASS_MAIN");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _terminal = EnvVarGuard::set("TERM", "xterm-kitty");
+        let _cursor = EnvVarGuard::unset("CURSOR_TRACE_ID");
+        let _askpass = EnvVarGuard::unset("VSCODE_GIT_ASKPASS_MAIN");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _runtime = runtime.enter();
         let text = last_repl_text_waiting_for(
@@ -18711,8 +18697,7 @@ mod tests {
 
     #[test]
     fn terminal_setup_matches_official_live_installer_receipt_and_file() {
-        use crate::utils::env_utils::EnvVarGuard;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("terminal-command-{}", uuid::Uuid::new_v4()));
         let fixture = install_keybindings_test_env(root.clone());
         let _vars = [
@@ -18720,6 +18705,8 @@ mod tests {
             EnvVarGuard::set("TERM_PROGRAM", "alacritty"),
             EnvVarGuard::unset("CURSOR_TRACE_ID"),
             EnvVarGuard::unset("VSCODE_GIT_ASKPASS_MAIN"),
+            // A host IDE's bundle ID would be detected before TERM_PROGRAM.
+            EnvVarGuard::unset("__CFBundleIdentifier"),
             EnvVarGuard::set("XDG_CONFIG_HOME", root.join("xdg")),
         ];
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -18897,8 +18884,8 @@ mod tests {
         crate::utils::process_runtime::initialize_test_process_runtime();
         // Submitting now awaits the UserPromptSubmit hooks, and this repository
         // configures one; without the pin the render would try to spawn it.
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _settings = IsolatedProjectSettings::pin();
         let event_stream = stream::iter(text_input_events("hello during query"));
         let canvases = collect_repl_spinner_owner_canvases(event_stream, 80, 12);
         let rendered = canvases
@@ -18997,7 +18984,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _lock = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         let before_session = crate::bootstrap::state::get_session_id();
         let permission = crate::utils::permissions::permission_update::apply_permission_update(
             &ToolPermissionContext::default(),
@@ -19060,10 +19047,10 @@ mod tests {
     fn hot_resume_matches_official_hook_identity_cache_and_no_early_write() {
         // REPL.tsx:2398-2452,2478-2510: hooks precede switch; restoreReadFileState
         // consumes messages+hooks with log.projectPath, and no separate hook write.
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path().join("config"));
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let _remote = EnvVarGuard::set("CLAUDE_CODE_ENVIRONMENT_KIND", "byoc");

@@ -893,8 +893,7 @@ fn check_command_and_suggest_rules(
     }
 
     if !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK")
             .as_deref(),
     ) {
         let safety_result = super::bash_security::bash_command_is_safe_deprecated(command);
@@ -1293,8 +1292,7 @@ pub fn bash_tool_has_permission(
     }
 
     if !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK")
             .as_deref(),
     ) {
         let safety_result = super::bash_security::bash_command_is_safe_deprecated(command);
@@ -1554,6 +1552,7 @@ mod tests {
     use crate::types::permissions::{
         PermissionBehavior, PermissionRuleSource, PermissionRuleValue, PermissionUpdateDestination,
     };
+    use crate::utils::test_env::PinnedProjectDir;
 
     #[test]
     fn simple_and_first_word_prefixes_match_official_filters() {
@@ -1814,7 +1813,7 @@ mod tests {
     #[test]
     fn bash_tool_check_permission_runs_path_sed_mode_and_read_only_layers() {
         // The path layer resolves against the project dir.
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let default_context = ToolPermissionContext::default();
         assert!(matches!(
             bash_tool_check_permission("git status", &default_context, false, &std::env::current_dir().unwrap()),

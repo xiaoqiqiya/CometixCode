@@ -2,6 +2,7 @@
 //! Native archive encoding uses the existing flate2 DEFLATE engine in place
 //! of fflate; compressed byte streams/timestamps are not byte-identical, but
 //! file order, content and Unix mode attributes retain the source contract.
+use crate::utils::process_env::JsTruthy;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 // Node path.join built-in boundary (no business policy; normalize all parts).
@@ -41,7 +42,7 @@ pub fn get_plugin_zip_cache_path() -> Option<PathBuf> {
         return None;
     }
     crate::utils::process_env::var("CLAUDE_CODE_PLUGIN_CACHE_DIR")
-        .filter(|s| !s.is_empty())
+        .truthy()
         .map(|s| PathBuf::from(crate::utils::permissions::path_validation::expand_tilde(&s)))
 }
 /// Maps to: CC `utils/plugins/zipCache.ts:75-81#getZipCacheKnownMarketplacesPath`.
@@ -96,7 +97,7 @@ pub fn get_session_plugin_cache_path()
                             .map(|b| format!("{b:02x}"))
                             .collect::<String>();
                         let dir = zip_path!(
-                            std::env::temp_dir(),
+                            crate::utils::node_os::tmpdir(),
                             format!("claude-plugin-session-{suffix}")
                         );
                         crate::utils::fs_operations::get_fs_implementation()

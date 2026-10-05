@@ -93,7 +93,7 @@ pub fn get_stats_cache_path() -> PathBuf {
     {
         return path;
     }
-    crate::utils::config::get_config_home().join(STATS_CACHE_FILENAME)
+    crate::utils::env_utils::get_claude_config_home_dir().join(STATS_CACHE_FILENAME)
 }
 
 pub fn with_stats_cache_lock<T>(callback: impl FnOnce() -> T) -> T {
@@ -388,10 +388,11 @@ pub fn next_day(date: NaiveDate) -> Option<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn compatible_newer_stats_cache_is_read_without_being_downgraded() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-stats-cache-{}", uuid::Uuid::new_v4()));
         let path = root.join("stats-cache.json");
