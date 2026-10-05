@@ -107,8 +107,21 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      # - name: Upload assets to GitHub Release
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     files: release-assets/*
+      #     generate_release_notes: true
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
           generate_release_notes: true
+          # 1. 动态设置 tag_name：如果是 tag 则用原 tag，否则用 sha 前缀生成临时 tag
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+          # 2. 动态设置 release 名称
+          release_name: ${{ github.ref_type == 'tag' && github.ref_name || format('Dev Build ({0})', github.sha) }}
+          # 3. 非 tag 触发时标记为预发布 (Prerelease)
+          prerelease: ${{ github.ref_type != 'tag' }}
+          # 4. 确保开发版不会覆盖最新的正式版 "Latest" 标识
+          make_latest: ${{ github.ref_type == 'tag' }}
